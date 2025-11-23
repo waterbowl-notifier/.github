@@ -1,57 +1,175 @@
 # Water Bowl Monitoring System
 
-## Introduction
-
-Welcome to the Water Bowl Monitoring System project! This innovative solution leverages IoT (Internet of Things) technology to ensure that water bowls for pets or livestock are consistently filled and functional. The system is built around an ESP32 microcontroller equipped with an HCSR04 ultrasonic sensor, which measures the water level in a bowl and reports this data to an AWS-based backend for monitoring and alerting.
-
 ## Overview
 
-The primary objective of this project is to automate the monitoring of water levels in bowls, providing real-time updates and alerts to ensure that the bowls are always adequately filled. This system minimizes the risk of water shortages for animals and ensures timely intervention when refills are needed or if any issues arise.
+This project implements an IoT-based monitoring system for water bowls (e.g., for pets or automated feeders). It uses ESP32 devices with ultrasonic sensors to measure water levels, sends data to AWS IoT Core via MQTT, processes the data in AWS Lambda to determine bowl states (green, yellow, red, black), stores statuses in DynamoDB, and controls RGB LEDs on the devices for visual feedback. A separate monitoring Lambda periodically checks DynamoDB for stale data or non-optimal states and sends notifications via SNS.
 
-## System Components
+The system emphasizes reliability with features like exception handling, retry logic, timezone-aware timestamps, and configurable thresholds. It is built using MicroPython for the device firmware and Python for AWS Lambda functions.
 
-### ESP32 Microcontroller with HCSR04 Sensor
-The ESP32 microcontroller, running MicroPython, is equipped with an HCSR04 ultrasonic sensor. This sensor measures the distance from the top of the bowl to the water surface, allowing the system to calculate the current water level. Every 20 minutes, the ESP32 sends the measured water level as a float value to the AWS backend via an HTTPS REST request.
+Key goals:
+- Real-time water level monitoring and visualization via LED colors.
+- Alerts for low water levels or device failures.
+- Low-power operation on battery-powered ESP32 devices.
 
-### AWS Backend
-The AWS backend comprises a set of Lambda functions and a DynamoDB table to manage and process the incoming data. The backend is responsible for determining the state of each water bowl and sending notifications when necessary. The following Lambda functions support the system:
+## Architecture
 
-1. **State Lambda**: This function processes POST HTTP requests from the ESP32 devices, determines the water level status (green, yellow, red, black), and updates the DynamoDB table with the current status and timestamp.
+1. **Device Layer (ESP32 with MicroPython)**:
+   - Ultrasonic sensor (HC-SR04) measures distance to water surface (higher distance = lower level).
+   - Connects to Wi-Fi, syncs time via NTP, publishes water level to AWS IoT MQTT.
+   - Subscribes to MQTT for LED color commands.
+   - Enters deep sleep/low-power modes between measurements.
 
-2. **State Reporting Lambda**: This function scans the DynamoDB table for the latest water bowl statuses, evaluates the timeliness of the records, and generates detailed reports for non-green statuses. It sends notifications using AWS SNS.
+2. **Cloud Ingestion (AWS IoT Core)**:
+   - Receives telemetry via MQTT topics (e.g., `local/waterbowl/<hostname>/status/depth`).
+   - Triggers Lambda via IoT Rules.
 
-3. **Keepalive Monitor Lambda**: This function ensures the continuous operation of the system by monitoring the timestamped entries in the DynamoDB table. If a water bowl has not reported a status update within a specified time limit, it sends an alert via SNS.
+3. **Processing Layer (AWS Lambda - State Machine)**:
+   - Validates input, determines state based on thresholds.
+   - Updates DynamoDB with status and timestamp.
+   - Publishes LED color back to device via MQTT.
 
-4. **DynamoDB Cleanup Lambda**: This function automatically deletes outdated entries from the DynamoDB table based on a predefined age threshold, ensuring the table remains manageable and performance is optimized.
+4. **Storage (DynamoDB)**:
+   - Stores latest status per device (hostname as primary key).
 
-5. **DDB Cleanup Monitor Lambda**: This function monitors the item count in the DynamoDB table and sends a notification if the number of items exceeds a predefined threshold, indicating potential issues.
+5. **Monitoring Layer (AWS Lambda - Monitor)**:
+   - Scans DynamoDB periodically (e.g., via CloudWatch Events).
+   - Checks for outdated timestamps or non-green statuses.
+   - Sends SNS notifications with emoji-based summaries.
 
-## Water Bowl States
+6. **Notifications (SNS)**:
+   - Alerts for issues, simplified for quick reading (e.g., location from hostname).
 
-The system identifies four possible states for each water bowl based on the sensor readings:
-- **Green**: The bowl is full.
-- **Yellow**: The bowl needs refilling soon.
-- **Red**: The bowl is nearly empty.
-- **Black**: There is a malfunction or the water level cannot be quantified.
+## Components
 
-These states help prioritize maintenance actions and ensure that all bowls are properly monitored and maintained.
+### Device Firmware (MicroPython)
+
+The ESP32 firmware is split across several files for modularity:
+
+- **hcsr04.py**: Interfaces with the HC-SR04 ultrasonic sensor.
+  - Provides methods for single and multiple measurements (returns most common value for noise reduction).
+  - Uses `machine` and `utime` for GPIO and timing.
+  - Distance calculation: `(pulse_time / 2) / 29.1` cm (approximates speed of sound).
+
+- **exception_notifier.py**: Handles crashes by logging tracebacks and sending HTTP notifications.
+  - Logs to a local file and POSTs to a configurable URL.
+  - Uses `urequests` for HTTP and `uio` for traceback capture.
+
+- **main.py**: Core script for device operation.
+  - Loads config from `my_config.json` (Wi-Fi, pins, certs, etc.).
+  - Connects to Wi-Fi with retries and LED blinking.
+  - Measures water level, publishes to MQTT with TLS.
+  - Subscribes to color topic and updates RGB LED via PWM.
+  - Sleeps for configurable minutes (deep sleep if LED off).
+  - Utilities: Prime-based backoff, MAC address formatting, MQTT connection with DER certs.
+
+Configuration (`my_config.json` example structure):
+```json
+{
+  "wifi_ssid": "your-ssid",
+  "wifi_password": "your-password",
+  "sleep_minutes": 5,
+  "measure_count": 3,
+  "iot_endpoint": "your-iot-endpoint.amazonaws.com",
+  "crash_notify_url": "https://your-notify-url.com",
+  "rgb_red_pin": 12,
+  "rgb_green_pin": 13,
+  "rgb_blue_pin": 14,
+  "<mac-address>": {
+    "hostname": "bowl-1",
+    "gpio_hcsr04_trigger_pin": 5,
+    "gpio_hcsr04_echo_pin": 18,
+    "cert": "/path/to/cert.der",
+    "key": "/path/to/key.der",
+    "ca": "/path/to/ca.der"
+  }
+}
+```
+
+### AWS Lambda Functions (Python)
+
+- **State Machine Lambda** (e.g., `water_bowl_state_machine.py`):
+  - Triggered by AWS IoT events with `water_level` and `hostname`.
+  - Validates input, ignores tests, rounds levels to 1 decimal.
+  - Determines state: black (full/error), green, yellow, red (based on distance thresholds).
+  - Updates DynamoDB (hostname PK, status, US/Central ISO timestamp).
+  - Publishes MQTT color command (e.g., `{"LED": "0,255,0"}` for green).
+  - Logging with WBSxxx codes for easy CloudWatch filtering.
+  - Environment vars: Thresholds, DynamoDB table, IoT endpoint, etc.
+  - Notes: S3 remnants unused; handles errors by logging/early return.
+
+- **Monitoring Lambda** (e.g., `water_bowl_monitor.py`):
+  - Scans DynamoDB for all items.
+  - Checks timestamps against `TIME_DELTA_HOURS` in US/Central.
+  - If outdated: SNS alert listing offenders.
+  - If valid but non-green: SNS summary with emojis (e.g., 🟡 for yellow, 🚨 for red).
+  - Simplifies hostnames (e.g., 'bowl-1' → 'bowl').
+  - Environment vars: Table name, region, SNS topic ARN, delta hours.
+  - Trigger: Periodic via CloudWatch.
+
+DynamoDB Table Schema (`water-bowl-status`):
+- Primary Key: `hostname` (String)
+- Attributes:
+  - `waterbowl_status` (String: 'green'|'yellow'|'red'|'black')
+  - `waterbowl_timestamp` (String: ISO-8601 in US/Central)
+
+### AWS Resources
+
+- **IoT Core**: Custom endpoint for MQTT; rules to trigger state Lambda on depth topics.
+- **SNS Topic**: For notifications; subscribe via email/SMS.
+- **DynamoDB**: Simple table for status persistence.
+- **CloudWatch**: For logs and scheduling monitor Lambda.
 
 ## Setup and Deployment
 
-### Hardware Setup
-1. Connect the HCSR04 sensor to the ESP32 microcontroller.
-2. Program the ESP32 with MicroPython to measure the water level and send data to the AWS backend.
+1. **Device Setup**:
+   - Flash MicroPython on ESP32.
+   - Upload firmware files and `my_config.json`.
+   - Wire HC-SR04 (trigger/echo pins) and RGB LED (PWM pins).
+   - Generate/provision AWS IoT certs (DER format).
 
-### AWS Backend Setup
-1. Deploy the Lambda functions and set up the DynamoDB table.
-2. Configure the environment variables for each Lambda function, such as DynamoDB table names, thresholds, and SNS topics.
-3. Set up the necessary IAM roles and permissions to allow the Lambda functions to interact with DynamoDB and SNS.
+2. **AWS Setup**:
+   - Create IoT Thing per device with certs.
+   - Set up IoT Rule: SQL SELECT on depth topic → Lambda action.
+   - Deploy Lambdas with IAM roles (IoT, DynamoDB, SNS access).
+   - Create DynamoDB table.
+   - Create SNS topic and subscribe.
+   - Schedule monitor Lambda (e.g., every hour).
 
-### Testing and Monitoring
-1. Test the ESP32 device to ensure it correctly measures and sends water level data.
-2. Monitor the AWS backend to verify that data is being processed and statuses are updated correctly.
-3. Check the SNS notifications to ensure alerts are sent as expected.
+3. **Testing**:
+   - Simulate events in Lambda console.
+   - Use test hostnames (ignored if contain 'test').
+   - Monitor CloudWatch logs (search WBSxxx).
 
-## Conclusion
+## Environment Variables
 
-The Water Bowl Monitoring System is a robust solution for ensuring the consistent availability of water for pets and livestock. By integrating IoT technology with AWS services, the system provides real-time monitoring, efficient data management, and timely notifications, making it a reliable tool for animal care management. This README provides an overview of the project setup and functionality, serving as a guide to understanding and deploying the system.
+- **State Lambda**:
+  - BUCKET_NAME (legacy)
+  - REGION
+  - GREEN_THRESHOLD_CM (e.g., 6.0)
+  - YELLOW_THRESHOLD_CM (e.g., 10.0)
+  - RED_THRESHOLD_CM (e.g., 11.0)
+  - DYNAMODB_TABLE
+  - IOT_ENDPOINT
+
+- **Monitor Lambda**:
+  - TABLE_NAME
+  - REGION
+  - TOPIC_ARN
+  - TIME_DELTA_HOURS (e.g., 1.0)
+
+## Error Handling and Logging
+
+- Device: Notifies crashes via HTTP; resets on exceptions.
+- State Lambda: Logs failures; continues on MQTT errors.
+- Monitor Lambda: Logs scan errors; returns 500 on failures.
+- All use US/Central for consistency.
+
+## Notes
+
+- Thresholds assume distance sensor: Adjust for bowl size.
+- LEDs: 0-255 RGB mapped to 16-bit PWM.
+- Power: Deep sleep for efficiency.
+- Scalability: Supports multiple bowls via hostnames.
+- Future: Add S3 for historical data; temperature compensation for sensor.
+
+For contributions or issues, see repository guidelines.
